@@ -16,24 +16,89 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      # Existing daily extract: preserve the URL, format, and file path.
       - name: Fetch Alma hours XML
         env:
           ALMA_API_KEY: ${{ secrets.ALMA_API_KEY }}
         run: |
           mkdir -p docs
-
           curl --fail --silent --show-error \
             "https://api-na.hosted.exlibrisgroup.com/almaws/v1/conf/libraries/MAIN/open-hours?from=today&apikey=${ALMA_API_KEY}" \
             -o docs/open-hours.xml
 
           test -s docs/open-hours.xml
 
-      - name: Commit cached file
+      # New extract: Monday of this week through Sunday of next week.
+      # A weekly failure must not prevent the daily cache from being committed.
+      - name: Fetch and validate weekly hours XML
+        id: weekly
+        continue-on-error: true
+        env:
+          ALMA_API_KEY: ${{ secrets.ALMA_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Use the library's local calendar date, not the runner's UTC date.
+          today=$(TZ=America/Los_Angeles date +%F)
+          weekday=$(date -u -d "$today" +%u)
+          from=$(date -u -d "$today - $((weekday - 1)) days" +%F)
+          to=$(date -u -d "$from + 13 days" +%F)
+          echo "Weekly hours range: $from through $to"
+
+          # Do not replace the last good XML until the new response validates.
+          temp=$(mktemp)
+          trap 'rm -f "$temp"' EXIT
+
+          curl --fail --silent --show-error --max-time 60 \
+            --header 'Accept: application/xml' \
+            --get 'https://api-na.hosted.exlibrisgroup.com/almaws/v1/conf/libraries/MAIN/open-hours' \
+            --data-urlencode "from=$from" \
+            --data-urlencode "to=$to" \
+            --data-urlencode "apikey=$ALMA_API_KEY" \
+            --output "$temp"
+
+          # Require exactly 14 consecutive dates and an hours element per day.
+          # Empty hours elements are valid closures, not missing data.
+          python3 - "$temp" "$from" "$to" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from datetime import date, timedelta
+
+          path, start, end = sys.argv[1:]
+          first = date.fromisoformat(start)
+          last = date.fromisoformat(end)
+          expected = [(first + timedelta(days=i)).isoformat()
+                      for i in range((last - first).days + 1)]
+          root = ET.parse(path).getroot()
+          if root.tag != 'days':
+              sys.exit('Unexpected weekly XML root element.')
+          actual = []
+          for day in root.findall('day'):
+              actual.append((day.findtext('date') or '').strip().removesuffix('Z'))
+              hours = day.find('hours')
+              if hours is None:
+                  sys.exit('Missing hours element in weekly XML.')
+              for period in hours:
+                  if (period.tag != 'hour' or not (period.findtext('from') or '').strip()
+                          or not (period.findtext('to') or '').strip()):
+                      sys.exit('Invalid opening period in weekly XML.')
+          if len(expected) != 14 or actual != expected:
+              sys.exit(f'Unexpected weekly dates: {actual}; expected {expected}')
+          print(f'Validated {len(actual)} days: {actual[0]} through {actual[-1]}')
+          PY
+
+          mv "$temp" docs/weekly-hours.xml
+
+      # Commit both caches together; keep the daily refresh working if weekly fails.
+      - name: Commit cached files
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
           git add docs/open-hours.xml
+          if [ -f docs/weekly-hours.xml ]; then
+            git add docs/weekly-hours.xml
+          fi
 
           if git diff --cached --quiet; then
             echo "No changes"
@@ -41,3 +106,10 @@ jobs:
             git commit -m "Refresh Alma hours cache"
             git push
           fi
+
+      # Surface weekly failures in Actions after the daily cache has been saved.
+      - name: Report weekly refresh failure
+        if: steps.weekly.outcome == 'failure'
+        run: |
+          echo '::error::Weekly hours refresh failed. Last good weekly XML retained.'
+          exit 1
